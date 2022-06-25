@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -207,19 +208,9 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 
 		p.Comments = comments
 
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
 		p.CSRFToken = csrfToken
 
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
-		if len(posts) >= postsPerPage {
-			break
-		}
+		posts = append(posts, p)
 	}
 
 	return posts, nil
@@ -389,7 +380,12 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	err := db.Select(&results, "SELECT `p.id`, `p.user_id`, `p.body`, `p.mime`, `p.created_at`, `u.account_name` "+
+		"FROM `posts` AS p FORCE INDEX(`posts_user_idx`) JOIN `users` AS u ON (p.user_id=u.id) "+
+		"WHERE u.del_flg=0 "+
+		"ORDER BY `created_at` DESC "+
+		"LIMIT 20",
+	)
 	if err != nil {
 		log.Print(err)
 		return
@@ -435,8 +431,12 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
-	if err != nil {
+	if err = db.Select(&results, "SELECT `p.id`, `p.user_id`, `p.body`, `p.mime`, `p.created_at`, `u.account_name` "+
+		"FROM `posts` AS p FORCE INDEX(`posts_user_idx`) JOIN `users` AS u ON (p.user_id=u.id) "+
+		"WHERE u.del_flg=0 "+
+		"ORDER BY `created_at` DESC "+
+		"LIMIT 20",
+	); err != nil {
 		log.Print(err)
 		return
 	}
@@ -523,8 +523,12 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
-	if err != nil {
+	if err = db.Select(&results, "SELECT `p.id`, `p.user_id`, `p.body`, `p.mime`, `p.created_at`, `u.account_name` "+
+		"FROM `posts` AS p FORCE INDEX(`posts_user_idx`) JOIN `users` AS u ON (p.user_id=u.id) "+
+		"WHERE u.del_flg=0 AND p.created <= ?"+
+		"ORDER BY `created_at` DESC "+
+		"LIMIT 20", t.Format(ISO8601Format),
+	); err != nil {
 		log.Print(err)
 		return
 	}
@@ -559,8 +563,12 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-	if err != nil {
+	if err = db.Select(&results, "SELECT `p.id`, `p.user_id`, `p.body`, `p.mime`, `p.created_at`, `u.account_name` "+
+		"FROM `posts` AS p FORCE INDEX(`posts_user_idx`) JOIN `users` AS u ON (p.user_id=u.id) "+
+		"WHERE u.del_flg=0 AND p.id=?"+
+		"ORDER BY `created_at` DESC "+
+		"LIMIT 20", pid,
+	); err != nil {
 		log.Print(err)
 		return
 	}
@@ -616,16 +624,19 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mime := ""
+	mime, format := "", ""
 	if file != nil {
 		// 投稿のContent-Typeからファイルのタイプを決定する
 		contentType := header.Header["Content-Type"][0]
 		if strings.Contains(contentType, "jpeg") {
 			mime = "image/jpeg"
+			format = "jpeg"
 		} else if strings.Contains(contentType, "png") {
 			mime = "image/png"
+			format = "png"
 		} else if strings.Contains(contentType, "gif") {
 			mime = "image/gif"
+			format = "gif"
 		} else {
 			session := getSession(r)
 			session.Values["notice"] = "投稿できる画像形式はjpgとpngとgifだけです"
@@ -656,7 +667,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		query,
 		me.ID,
 		mime,
-		filedata,
+		"",
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -666,6 +677,11 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 
 	pid, err := result.LastInsertId()
 	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	if err := ioutil.WriteFile(fmt.Sprintf("%d.%s", pid, format), filedata, 0664); err != nil {
 		log.Print(err)
 		return
 	}
@@ -694,8 +710,12 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		ext == "png" && post.Mime == "image/png" ||
 		ext == "gif" && post.Mime == "image/gif" {
 		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
+		bytes, err := ioutil.ReadFile(fmt.Sprintf("%d.%s", pid, ext))
 		if err != nil {
+			panic(err)
+		}
+
+		if _, err := w.Write(bytes); err != nil {
 			log.Print(err)
 			return
 		}
